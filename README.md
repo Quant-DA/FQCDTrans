@@ -32,8 +32,7 @@ conda env create -n fqcdtrans
 conda activate fqcdtrans
 pip install -r requirements.txt
 ```
-* Prepare datasets: OfficeHome dataset
-[OfficeHome](https://www.hemanthdv.org/officeHomeDataset.html)
+* Prepare datasets: [OfficeHome](https://www.hemanthdv.org/officeHomeDataset.html)
 
 ### Run File
 #### Inference
