@@ -47,4 +47,5 @@ pip install -r requirements.txt
     python test_cdtrans_quant.py --model_name 'ar2cl' --config_file '/home/sehyunpark/Quant_Preliminary/PSAQ-ViT/CDTrans/configs/ar2cl.yml' 
 ```
 
-
+## Citation
+Code refered from [CDTrans](https://github.com/CDTrans/CDTrans), [FQ-ViT](https://github.com/megvii-research/FQ-ViT), [PSAQ-ViT](https://github.com/zkkli/PSAQ-ViT)
