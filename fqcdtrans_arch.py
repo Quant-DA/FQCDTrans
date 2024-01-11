@@ -3,62 +3,24 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from fqvit_quant import *
-from util import no_grad_trunc_normal, to_2tuple, weights_init_kaiming, resize_pos_embed
+from fqcdtrans_quant import *
+from fqcdtrans_utils import *
 
 """
 BitType
 """
-class BitType:
-
-    def __init__(self, bits, signed, name=None):
-        self.bits = bits
-        self.signed = signed
-        if name is not None:
-            self.name = name
-        else:
-            self.update_name()
-
-    @property
-    def upper_bound(self):
-        if not self.signed:
-            return 2**self.bits - 1
-        return 2**(self.bits - 1) - 1
-
-    @property
-    def lower_bound(self):
-        if not self.signed:
-            return 0
-        return -(2**(self.bits - 1))
-
-    @property
-    def range(self):
-        return 2**self.bits
-
-    def update_name(self):
-        self.name = ''
-        if not self.signed:
-            self.name += 'uint'
-        else:
-            self.name += 'int'
-        self.name += '{}'.format(self.bits)
-
 BIT_TYPE_LIST = [
     BitType(4, False, 'uint4'),
     BitType(8, True, 'int8'),
     BitType(4, True, 'int4'),
-    BitType(8, False, 'uint8')
+    BitType(8, False, 'uint8'),
+    BitType(2, False, 'uint2'),
 ]
 BIT_TYPE_DICT = {bit_type.name: bit_type for bit_type in BIT_TYPE_LIST}
-
 
 """
 configs
 """
-# QAct
-BIT_TYPE_W = BIT_TYPE_DICT['int8']
-BIT_TYPE_A = BIT_TYPE_DICT['uint8']
-
 OBSERVER_W = 'minmax'
 OBSERVER_A = 'minmax'
 
@@ -70,48 +32,17 @@ CALIBRATION_MODE_W = 'channel_wise'
 CALIBRATION_MODE_A = 'layer_wise'
 CALIBRATION_MODE_S = 'layer_wise'
 
-# if lis:
 INT_SOFTMAX = True
-BIT_TYPE_S = BIT_TYPE_DICT['uint4']
 OBSERVER_S = 'minmax'
 QUANTIZER_S = 'log2'
-# else:
-#     INT_SOFTMAX = False
-#     BIT_TYPE_S = BIT_TYPE_DICT['uint8']
-#     OBSERVER_S = OBSERVER_A
-#     QUANTIZER_S = QUANTIZER_A
-# if ptf:
+
 INT_NORM = True
 OBSERVER_A_LN = 'ptf'
 CALIBRATION_MODE_A_LN = 'channel_wise'
-# else:
-#     INT_NORM = False
-#     OBSERVER_A_LN = OBSERVER_A
-#     CALIBRATION_MODE_A_LN = CALIBRATION_MODE_A
-
-
-
 
 """
 Modules with quantization
 """
-class QMatMul(nn.Module):
-    def __init__(self):
-        super(QMatMul, self).__init__()
-        self.register_buffer('act_scaling_factor', torch.zeros(1))
-    
-    def fix(self):
-        pass
-
-    def unfix(self):
-        pass
-
-    def forward(self, A, pre_act_scaling_factor_A, B, pre_act_scaling_factor_B):
-        A_int = A / pre_act_scaling_factor_A
-        B_int = B / pre_act_scaling_factor_B
-        act_scaling_factor = pre_act_scaling_factor_A * pre_act_scaling_factor_B
-        self.act_scaling_factor = act_scaling_factor
-        return (A_int @ B_int) * act_scaling_factor, act_scaling_factor
 
 class QPatchEmbed(nn.Module):
     """Image to Patch Embedding"""
@@ -124,7 +55,9 @@ class QPatchEmbed(nn.Module):
                  norm_layer=None,
                  quant=False,
                  calibrate=False,
-                 cfg=None):
+                 cfg=None,
+                 BIT_W='int8',
+                 BIT_A='uint4'):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -133,6 +66,7 @@ class QPatchEmbed(nn.Module):
 
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
+        
 
         self.proj = QConv2d(in_chans,
                             embed_dim,
@@ -140,7 +74,7 @@ class QPatchEmbed(nn.Module):
                             stride=patch_size,
                             quant=quant,
                             calibrate=calibrate,
-                            bit_type=BIT_TYPE_W,
+                            bit_type=BIT_W,
                             calibration_mode=CALIBRATION_MODE_W,
                             observer_str=OBSERVER_W,
                             quantizer_str=QUANTIZER_W)
@@ -148,14 +82,14 @@ class QPatchEmbed(nn.Module):
             self.qact_before_norm = QAct(
                 quant=quant,
                 calibrate=calibrate,
-                bit_type=BIT_TYPE_A,
+                bit_type=BIT_A,
                 calibration_mode=CALIBRATION_MODE_A,
                 observer_str=OBSERVER_A,
                 quantizer_str=QUANTIZER_A)
             self.norm = norm_layer(embed_dim)
             self.qact = QAct(quant=quant,
                              calibrate=calibrate,
-                             bit_type=BIT_TYPE_A,
+                             bit_type=BIT_A,
                              calibration_mode=CALIBRATION_MODE_A,
                              observer_str=OBSERVER_A,
                              quantizer_str=QUANTIZER_A)
@@ -164,7 +98,7 @@ class QPatchEmbed(nn.Module):
             self.norm = nn.Identity()
             self.qact = QAct(quant=quant,
                              calibrate=calibrate,
-                             bit_type=BIT_TYPE_A,
+                             bit_type=BIT_A,
                              calibration_mode=CALIBRATION_MODE_A,
                              observer_str=OBSERVER_A,
                              quantizer_str=QUANTIZER_A)
@@ -186,24 +120,6 @@ class QPatchEmbed(nn.Module):
                           self.qact.quantizer)
         x = self.qact(x)
         return x
-    '''
-    def forward(self, x):
-        # B, C, H, W = x.shape
-        C, H, W = x.shape # for iteration 
-        # FIXME look at relaxing size constraints
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        x = self.qact_before_norm(x)
-        if isinstance(self.norm, nn.Identity):
-            x = self.norm(x)
-        else:
-            x = self.norm(x, self.qact_before_norm.quantizer,
-                          self.qact.quantizer)
-        x = self.qact(x)
-        return x
-    '''
 
 
 class QMlp(nn.Module):
@@ -216,23 +132,26 @@ class QMlp(nn.Module):
                  drop=0.0,
                  quant=False,
                  calibrate=False,
-                 cfg=None):
+                 cfg=None,
+                 BIT_W='int8',
+                 BIT_A='uint4'):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
+
         # self.fc1 = nn.Linear(in_features, hidden_features)
         self.fc1 = QLinear(in_features,
                            hidden_features,
                            quant=quant,
                            calibrate=calibrate,
-                           bit_type=BIT_TYPE_W,
+                           bit_type=BIT_W,
                            calibration_mode=CALIBRATION_MODE_W,
                            observer_str=OBSERVER_W,
                            quantizer_str=QUANTIZER_W)
         self.act = act_layer()
         self.qact1 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
@@ -241,13 +160,13 @@ class QMlp(nn.Module):
                            out_features,
                            quant=quant,
                            calibrate=calibrate,
-                           bit_type=BIT_TYPE_W,
+                           bit_type=BIT_W,
                            calibration_mode=CALIBRATION_MODE_W,
                            observer_str=OBSERVER_W,
                            quantizer_str=QUANTIZER_W)
         self.qact2 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
@@ -273,7 +192,10 @@ class QCDTransAttention(nn.Module):
         drop_attn_rate, 
         drop_proj_rate,
         quant=False,
-        calibrate=False):
+        calibrate=False,
+        BIT_W='int8',
+        BIT_A='uint4',
+        BIT_S='uint8'):
         super(QCDTransAttention, self).__init__()
         head_dim = dim // num_heads # 64
         self.num_heads = num_heads 
@@ -284,20 +206,20 @@ class QCDTransAttention(nn.Module):
                            bias=qkv_bias,
                            quant=quant,
                            calibrate=calibrate,
-                           bit_type=BIT_TYPE_W,
+                           bit_type=BIT_W,
                            calibration_mode=CALIBRATION_MODE_W,
                            observer_str=OBSERVER_W,
                            quantizer_str=QUANTIZER_W)
         self.qact1 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
         self.matmul1 = QMatMul()
         self.qact2 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
@@ -305,21 +227,21 @@ class QCDTransAttention(nn.Module):
             log_i_softmax=INT_SOFTMAX,
             quant=quant,
             calibrate=calibrate,
-            bit_type=BIT_TYPE_S,
+            bit_type=BIT_S,
             calibration_mode=CALIBRATION_MODE_S,
             observer_str=OBSERVER_S,
             quantizer_str=QUANTIZER_S) # log_int_softmax
         
         self.qact_attn1 = QAct(quant=quant,
                                calibrate=calibrate,
-                               bit_type=BIT_TYPE_A,
+                               bit_type=BIT_A,
                                calibration_mode=CALIBRATION_MODE_A,
                                observer_str=OBSERVER_A,
                                quantizer_str=QUANTIZER_A) #qact2
         
         self.qact3 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A) 
@@ -330,7 +252,7 @@ class QCDTransAttention(nn.Module):
                             dim,
                             quant=quant,
                             calibrate=calibrate,
-                            bit_type=BIT_TYPE_W,
+                            bit_type=BIT_W,
                             calibration_mode=CALIBRATION_MODE_W,
                             observer_str=OBSERVER_W,
                             quantizer_str=QUANTIZER_W)
@@ -438,12 +360,17 @@ class QCDTransBlock(nn.Module):
         act_layer=nn.GELU, 
         norm_layer=nn.LayerNorm,
         quant=False,
-        calibrate=False):
+        calibrate=False,
+        BIT_W='int8',
+        BIT_A='uint8',
+        BIT_S='uint8'
+        ):
         super(QCDTransBlock, self).__init__()
+        
         self.norm1 = norm_layer(dim)
         self.qact1 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
@@ -452,18 +379,21 @@ class QCDTransBlock(nn.Module):
                               qkv_bias=qkv_bias,
                               qk_scale=qk_scale,
                               drop_attn_rate=drop_attn_rate,
-                              drop_proj_rate=drop_rate)
+                              drop_proj_rate=drop_rate,
+                              BIT_W=BIT_W,
+                              BIT_A=BIT_A,
+                              BIT_S=BIT_S)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         self.qact_pos = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A_LN,
                           observer_str=OBSERVER_A_LN,
                           quantizer_str=QUANTIZER_A_LN) #qact2 = qact_pos
         self.norm2 = norm_layer(dim)
         self.qact3 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
@@ -473,10 +403,12 @@ class QCDTransBlock(nn.Module):
                        act_layer=act_layer,
                        drop=drop_rate,
                        quant=quant,
-                       calibrate=calibrate)
+                       calibrate=calibrate,
+                       BIT_W=BIT_W,
+                       BIT_A=BIT_A)
         self.qact4 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A_LN,
                           observer_str=OBSERVER_A_LN,
                           quantizer_str=QUANTIZER_A_LN)
@@ -553,7 +485,8 @@ class FQCDTrans(nn.Module):
         img_size=224,
         patch_size=16,
         in_chans=3,
-        num_classes=1000,
+        num_classes=1000, # Head For ImageNet 
+        num_classes_dataset=65,
         embed_dim=768,
         depth=12,
         num_heads=12,
@@ -570,15 +503,17 @@ class FQCDTrans(nn.Module):
         drop_path_rate=0.0,
         quant=False,
         calibrate=False,
-        input_quant=False):
+        input_quant=False,
+        BIT_W='int8',
+        BIT_A='uint8',
+        BIT_S='uint8'):
         super().__init__()
         act_layer = act_layer or nn.GELU
         norm_layer = norm_layer or nn.LayerNorm
         dprs = [x.item() for x in torch.linspace(0, last_drop_path_rate, depth)]  # Stochastic depth decay rule
         self.dataset = dataset
         self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim        
-
+        self.num_features = self.embed_dim = embed_dim    
 
         # for fqvit(PTQ)
         self.input_quant = input_quant
@@ -586,7 +521,7 @@ class FQCDTrans(nn.Module):
             self.qact_input = QAct(quant=quant,
                                    calibrate=calibrate,
                                    # last_calibrate=False,
-                                   bit_type=BIT_TYPE_A,
+                                   bit_type=BIT_A,
                                    calibration_mode=CALIBRATION_MODE_A,
                                    observer_str=OBSERVER_A,
                                    quantizer_str=QUANTIZER_A)
@@ -595,7 +530,9 @@ class FQCDTrans(nn.Module):
                                         in_chans=in_chans,
                                         embed_dim=embed_dim,
                                         quant=quant,
-                                        calibrate=calibrate)
+                                        calibrate=calibrate,
+                                        BIT_W=BIT_W,
+                                        BIT_A=BIT_A)
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches+1, embed_dim))
@@ -603,19 +540,19 @@ class FQCDTrans(nn.Module):
         
         self.qact_embed = QAct(quant=quant,
                                calibrate=calibrate,
-                               bit_type=BIT_TYPE_A,
+                               bit_type=BIT_A,
                                calibration_mode=CALIBRATION_MODE_A,
                                observer_str=OBSERVER_A,
                                quantizer_str=QUANTIZER_A) # embedding activation
         self.qact_pos = QAct(quant=quant,
                              calibrate=calibrate,
-                             bit_type=BIT_TYPE_A,
+                             bit_type=BIT_A,
                              calibration_mode=CALIBRATION_MODE_A,
                              observer_str=OBSERVER_A,
                              quantizer_str=QUANTIZER_A) # positional activation
         self.qact1 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A_LN,
                           observer_str=OBSERVER_A_LN,
                           quantizer_str=QUANTIZER_A_LN)
@@ -631,11 +568,14 @@ class FQCDTrans(nn.Module):
                   act_layer = act_layer,
                   norm_layer=norm_layer,
                   quant=quant,
-                  calibrate=calibrate) for i in range(depth)])
+                  calibrate=calibrate,
+                  BIT_W=BIT_W,
+                  BIT_A=BIT_A,
+                  BIT_S=BIT_S) for i in range(depth)],)
         self.norm = norm_layer(embed_dim)
         self.qact2 = QAct(quant=quant,
                           calibrate=calibrate,
-                          bit_type=BIT_TYPE_A,
+                          bit_type=BIT_A,
                           calibration_mode=CALIBRATION_MODE_A,
                           observer_str=OBSERVER_A,
                           quantizer_str=QUANTIZER_A)
@@ -643,32 +583,26 @@ class FQCDTrans(nn.Module):
                              num_classes,
                              quant=quant,
                              calibrate=calibrate,
-                             bit_type=BIT_TYPE_W,
+                             bit_type=BIT_W,
                              calibration_mode=CALIBRATION_MODE_W,
                              observer_str=OBSERVER_W,
                              quantizer_str=QUANTIZER_W)
                      if num_classes > 0 else nn.Identity())
         self.act_out = QAct(quant=quant,
                             calibrate=calibrate,
-                            bit_type=BIT_TYPE_A,
+                            bit_type=BIT_A,
                             calibration_mode=CALIBRATION_MODE_A,
                             observer_str=OBSERVER_A,
                             quantizer_str=QUANTIZER_A)        # Classifier for officehome
-        # self.qact5 = QAct(quant=quant,
-                          # calibrate=calibrate,
-                          # bit_type=BIT_TYPE_A,
-                          # calibration_mode=CALIBRATION_MODE_A,
-                          # observer_str=OBSERVER_A,
-                          # quantizer_str=QUANTIZER_A) # for bottleneck
         self.classifier = (QLinear(self.embed_dim,
-                             65,
+                             num_classes_dataset,
                              quant=quant,
                              calibrate=calibrate,
-                             bit_type=BIT_TYPE_W,
+                             bit_type=BIT_W,
                              calibration_mode=CALIBRATION_MODE_W,
                              observer_str=OBSERVER_W,
                              quantizer_str=QUANTIZER_W)
-                     if num_classes > 0 else nn.Identity()) # For classifier of OfficeHome
+                     if num_classes_dataset > 0 else nn.Identity()) # For classifier of OfficeHome
 
         no_grad_trunc_normal(self.pos_embed, std=0.02)
         no_grad_trunc_normal(self.cls_token, std=0.02)
@@ -815,14 +749,14 @@ class FQCDTrans(nn.Module):
         else:
             x1, x2, x3 = self.forward_features(x1, x2, target_branch_only)
             if self.dataset == 'imagenet': x1 = self.head(x1)
-            elif self.dataset == 'office_home': 
+            elif self.dataset == 'office_home' or 'visda': 
                 x1 = self.classifier(x1)
                 # x1 = self.act_out(x1)
             else: NotImplementedError
             # x1, _ = self.qact5(x1)
 
             if self.dataset == 'imagenet': x2 = self.head(x2)
-            elif self.dataset == 'office_home': 
+            elif self.dataset == 'office_home' or 'visda': 
                 x2 = self.classifier(x2)
                 # x2 = self.act_out(x2)
             else: NotImplementedError
@@ -830,7 +764,7 @@ class FQCDTrans(nn.Module):
             # x2, _ = self.qact5(x2)
 
             if self.dataset == 'imagenet': x3 = self.head(x3)
-            elif self.dataset == 'office_home': 
+            elif self.dataset == 'office_home' or 'visda': 
                 x3 = self.classifier(x3)
                 # x3 = self.act_out(x3)
             else: NotImplementedError
@@ -869,67 +803,67 @@ class FQCDTrans(nn.Module):
 
 
 
-def deit_small_patch16(
-    input_size,
-    dataset,
-    quantized,
-    cdtrans,
-    pretrained,
-    ckpt_dir,
-    **kwargs):
+# def deit_small_patch16(
+#     input_size,
+#     dataset,
+#     quantized,
+#     cdtrans,
+#     pretrained,
+#     ckpt_dir,
+#     **kwargs):
 
-    if pretrained and ckpt_dir is not None:
-        if 'source_train_val_vit' in ckpt_dir or 'source_train_vit' in ckpt_dir:
-            print(f"Get pretrained checkpoint from {ckpt_dir}")
-            ckpt = torch.load(ckpt_dir)['model']
-            for param in ckpt.keys():
-                if param not in model.state_dict().keys():
-                    print(f"Param {param} not in model.state_dict().keys()")
-                    continue
-                else:
-                    model.state_dict()[param].copy_(ckpt[param])
-        elif 'implementation_check_cdtrans' in ckpt_dir:
-            print(f"Get pretrained checkpoint from {ckpt_dir}")
-            try:
-                model.load_state_dict(torch.load(ckpt_dir)['model'])
-            except Exception as e:
-                print(e)
+#     if pretrained and ckpt_dir is not None:
+#         if 'source_train_val_vit' in ckpt_dir or 'source_train_vit' in ckpt_dir:
+#             print(f"Get pretrained checkpoint from {ckpt_dir}")
+#             ckpt = torch.load(ckpt_dir)['model']
+#             for param in ckpt.keys():
+#                 if param not in model.state_dict().keys():
+#                     print(f"Param {param} not in model.state_dict().keys()")
+#                     continue
+#                 else:
+#                     model.state_dict()[param].copy_(ckpt[param])
+#         elif 'implementation_check_cdtrans' in ckpt_dir:
+#             print(f"Get pretrained checkpoint from {ckpt_dir}")
+#             try:
+#                 model.load_state_dict(torch.load(ckpt_dir)['model'])
+#             except Exception as e:
+#                 print(e)
 
-        elif 'implementation_check_ivit' in ckpt_dir:
-            print(f"Get pretrained checkpoint from {ckpt_dir}")
-            ckpt = torch.load(ckpt_dir, map_location = 'cpu')['model'] # , map_location = 'cuda:0'
-            for param in model.state_dict().keys():
-                if model.state_dict()[param].shape != ckpt[param].shape:
-                    if 'act_scaling_factor' in param and model.state_dict()[param].shape == torch.Size([1]): 
-                        model.state_dict()[param] = model.state_dict()[param].squeeze() # torch.Size([1]) -> torch.Size([])
-                    # elif 'norm_scaling_factor' in param and model.state_dict()[param].shape == torch.Size([1]):
-                    #     model.state_dict()[param] = torch.zeros(384) # torch.Size([1]) -> torch.Size([384])
-            try:
-                model.load_state_dict(torch.load(ckpt_dir, map_location = 'cpu')['model'])
-            except Exception as e:
-                print(e)
+#         elif 'implementation_check_ivit' in ckpt_dir:
+#             print(f"Get pretrained checkpoint from {ckpt_dir}")
+#             ckpt = torch.load(ckpt_dir, map_location = 'cpu')['model'] # , map_location = 'cuda:0'
+#             for param in model.state_dict().keys():
+#                 if model.state_dict()[param].shape != ckpt[param].shape:
+#                     if 'act_scaling_factor' in param and model.state_dict()[param].shape == torch.Size([1]): 
+#                         model.state_dict()[param] = model.state_dict()[param].squeeze() # torch.Size([1]) -> torch.Size([])
+#                     # elif 'norm_scaling_factor' in param and model.state_dict()[param].shape == torch.Size([1]):
+#                     #     model.state_dict()[param] = torch.zeros(384) # torch.Size([1]) -> torch.Size([384])
+#             try:
+#                 model.load_state_dict(torch.load(ckpt_dir, map_location = 'cpu')['model'])
+#             except Exception as e:
+#                 print(e)
 
-        elif 'implementation_check_fqvit' in ckpt_dir:
-            print(f"Get pretrained checkpoint from {ckpt_dir}")
-            try:
-                model.load_state_dict(torch.load(ckpt_dir)['model'])
-            except Exception as e:
-                print(e)
-        elif 'distilled' in ckpt_dir: # for imagenet checkpoint from deit_distilled model 
-            print("Get pretrained checkpoint from deit_distilled model")
-            model.load_distilled_param(ckpt_dir)
-        elif 'imagenet' in ckpt_dir:
-            ckpt = torch.hub.load_state_dict_from_url(
-                url="https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth",
-                map_location="cpu", 
-                check_hash=True)
-            if ('num_classes' in kwargs.keys()) and (kwargs['num_classes'] != 1000):
-                for key in list(ckpt['model'].keys()):
-                    if 'head' in key:
-                        del ckpt['model'][key]
-            model.load_state_dict(ckpt['model'], strict=False)
-        else:
-            print('wrong pretrained model')
-    else:
-        print('no pretrained model')
-    return model
+#         elif 'implementation_check_fqvit' in ckpt_dir:
+#             print(f"Get pretrained checkpoint from {ckpt_dir}")
+#             try:
+#                 model.load_state_dict(torch.load(ckpt_dir)['model'])
+#             except Exception as e:
+#                 print(e)
+#         elif 'distilled' in ckpt_dir: # for imagenet checkpoint from deit_distilled model 
+#             print("Get pretrained checkpoint from deit_distilled model")
+#             model.load_distilled_param(ckpt_dir)
+#         elif 'imagenet' in ckpt_dir:
+#             ckpt = torch.hub.load_state_dict_from_url(
+#                 url="https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth",
+#                 map_location="cpu", 
+#                 check_hash=True)
+#             if ('num_classes' in kwargs.keys()) and (kwargs['num_classes'] != 1000):
+#                 for key in list(ckpt['model'].keys()):
+#                     if 'head' in key:
+#                         del ckpt['model'][key]
+#             model.load_state_dict(ckpt['model'], strict=False)
+#         else:
+#             print('wrong pretrained model')
+#     else:
+#         print('no pretrained model')
+#     return model

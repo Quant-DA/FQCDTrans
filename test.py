@@ -12,74 +12,20 @@ from utils.logger import setup_logger
 from types import MethodType
 
 from functools import partial
-from arch_fq_cd import *
-# from utils_fq import MatMul, attention_forward, AttentionMap
+from fqcdtrans_arch import *
+from fqcdtrans_utils import *
 from generate_data import generate_data
 
 import datetime
-from datetime import timedelta
-import os
 
 PATH = os.getcwd()
-HOME = '/home/sehyunpark/Quant_Preliminary/'
-project_name = 'PSAQ_FQCDTrans_8/8/4'
+HOME = '/home/sehyunpark/PSAQ_FQCDTrans/log/'
+project_name = 'PSAQ_FQCDTrans'
+# Supports: ['int8', 'int4', 'int2', 'uint8', 'uint4', 'uint2]
+# args.weights = 'int8'
+# args.activation = 'uint8'
+# args.attn = 'uint8'
 
-def create_log_func(path):
-    f = open(path, 'a')
-    counter = [0]
-    def log(txt, color=None):
-        f.write(txt + '\n')
-        if color == 'red': txt = "\033[91m {}\033[00m" .format(txt)
-        elif color == 'green': txt = "\033[92m {}\033[00m" .format(txt)
-        elif color == 'violet': txt = "\033[95m {}\033[00m" .format(txt)
-        print(txt)
-        counter[0] += 1
-        if counter[0] % 10 == 0:
-            f.flush()
-            os.fsync(f.fileno())
-    return log, f.close
-
-def ckpt_mapping(ckpt):
-    key_map = {'base.fc.weight': 'head.weight',
-    'base.fc.bias': 'head.bias',}
-
-    # Rename keys in the checkpoint
-    new_state_dict = {}
-    for key, value in ckpt.items():
-        if 'base' in key:
-            new_key = key.replace('base.', '')  # Remove 'base.' prefix  
-        # new_state_dict[new_key] = value
-        if 'base.fc' in key:
-            new_key = key_map.get(key, key)  # Replace with new key if in map, else keep same 
-        if 'classifier.weight' in key:
-            new_key = 'classifier.weight'
-        if 'bottleneck' in key:
-            new_key = key
-        new_state_dict[new_key] = value
-    
-    return new_state_dict
-
-def calibration_load(calibration_set='/home/sehyunpark/Quant_Preliminary/PSAQ-ViT/CDTrans/calibration_set'):
-    # Transform to convert images to tensor
-    transform = transforms.Compose([
-        transforms.ToTensor(),  # Converts PIL Image or numpy.ndarray (H x W x C) in the range [0, 255] to a torch.FloatTensor of shape (C x H x W) in the range [0.0, 1.0]
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
-
-    # List to store the tensors
-    calibration_tensors = []
-
-    # Load each image, transform it, and add it to the list
-    # 32 images [Batch], img_shape = [3, 224, 224]
-    for filename in os.listdir(calibration_set):
-        if filename.endswith('.png') or filename.endswith('.jpg'):  # check for image files
-            image_path = os.path.join(calibration_set, filename)
-            image = Image.open(image_path)
-            image_tensor = transform(image)
-            calibration_tensors.append(image_tensor)
-
-    calibration_data_tensor = torch.stack(calibration_tensors)
-    return calibration_data_tensor
 
 def attention_forward(self, x1, x2, target_branch_only=True): # For CDTrans
     """
@@ -155,8 +101,6 @@ class MatMul(nn.Module):
     def forward(self, A, B):
         return A @ B
     
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FQCDTrans_Test")
     parser.add_argument(
@@ -172,13 +116,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", default='deit_small', help="baseline model", type=str)
     parser.add_argument(
-        "--model_name", default='ar2cl', help="baseline model", type=str)
+        "--model_name", default='ar2cl', help="CDTrans domain adaptation", type=str)
+    parser.add_argument(
+        "--calibration_mode", default='PSAQ', choices=['PSAQ', 'trainset', 'valset', 'gaussian'], \
+            help="mode of calibration set for PTQ", type=str)
+    parser.add_argument(
+        "--weights", default='int8', help="quantization bit for weights", type=str)
+    parser.add_argument(
+        "--activation", default='uint8', help="quantization bit for activation", type=str)
+    parser.add_argument(
+        "--attn", default='uint8', help="quantization bit for attention", type=str)
 
     args = parser.parse_args()
 
     if args.config_file != "":
         cfg.merge_from_file(args.config_file)
-    # cfg.merge_from_list(args.opts)
     cfg.freeze()
     
     #Time 
@@ -189,14 +141,15 @@ if __name__ == "__main__":
     
     # model_name = cfg.MODEL.MODE
     model_name = args.model_name
+    quantization = args.weights[-1] + '_' + args.activation[-1] + '_' + args.attn[-1]
     
-    if not os.path.exists(f"./{project_name}/report/{model_name}/"):
-        os.makedirs(f"./{project_name}/report/{model_name}/")
+    if not os.path.exists(f"{HOME}/{quantization}/{args.calibration_mode}/{model_name}"):
+        os.makedirs(f"{HOME}/{quantization}/{args.calibration_mode}/{model_name}")
     # For storing checkpoint after training
     # if not os.path.exists(f"./{project_name}/checkpoint/{model_name}/"):
     #     os.makedirs(f"./{project_name}/checkpoint/{model_name}/")
         
-    log_path = f"./{project_name}/report/{model_name}/{now}.log"
+    log_path = f"{HOME}/{quantization}/{args.calibration_mode}/{model_name}/{now}.log"
     log, log_close = create_log_func(log_path)          # Abbreviate log_func to log
     with open(log_path, 'w+') as f:
         pprint.pprint(f)
@@ -204,6 +157,9 @@ if __name__ == "__main__":
     log('******************************          Specifications          ******************************')
     log(f'Project name: {project_name}, at time {now}')
     log(f'Model: {model_name}')
+    log(f'Quantization Bits for {project_name}')
+    log(f'weights: {args.weights}, activation: {args.activation}, attn: {args.attn}')
+    log(f'Calibration Mode: {args.calibration_mode}')
 
     if args.config_file != "":
         log("Loaded configuration file {}".format(args.config_file))
@@ -224,22 +180,25 @@ if __name__ == "__main__":
     # Load Model 
     model = FQCDTrans(
         dataset='office_home',
-        patch_size=16,
-        embed_dim=384,
-        depth=12,
+        num_classes_dataset=65,
         num_classes=1000,
+        embed_dim=384,
         num_heads=6,
         mlp_ratio=4,
         qkv_bias=True,
         norm_layer=partial(QIntLayerNorm, eps=1e-6),
         quant=True,
         calibrate=False,
-        input_quant=True)
+        input_quant=True,
+        BIT_W=args.weights,
+        BIT_A=args.activation,
+        BIT_S=args.attn)
     
     model_fq = FQCDTrans(
-        patch_size=16,
+        dataset='office_home',
+        num_classes_dataset=65,
+        num_classes=1000,
         embed_dim=384,
-        depth=12,
         num_heads=6,
         mlp_ratio=4,
         qkv_bias=True,
@@ -253,47 +212,71 @@ if __name__ == "__main__":
     # model_ckpt = torch.load('/home/sehyunpark/Quant_Preliminary/checkpoints/officehome_uda_ar2cl_vit_small_384.pth')
     new_state_dict = ckpt_mapping(model_ckpt)       
     model.load_state_dict(new_state_dict, strict=False)
-    # model_fq.load_state_dict(new_state_dict, strict=False)
+    model_fq.load_state_dict(new_state_dict, strict=False)
     
-    # Generate calibration set
-    model_fq.to(device)
-    for name, module in model_fq.named_modules():
-        if isinstance(module, QCDTransAttention):
-            setattr(module, "matmul1", MatMul())
-            setattr(module, "matmul2", MatMul())
-            module.forward = MethodType(attention_forward, module)
+    # Setting Calibration Loader for PSAQ
+    if args.calibration_mode == "PSAQ":
+        # Generate calibration set
+        model_fq.to(device)
+        for name, module in model_fq.named_modules():
+            if isinstance(module, QCDTransAttention):
+                setattr(module, "matmul1", MatMul())
+                setattr(module, "matmul2", MatMul())
+                module.forward = MethodType(attention_forward, module)
+        log("Generating data.....")
+        log("Using {} as a model...".format(type(model_fq)))
+        calibration_data = generate_data(args, model_fq, name = "CDTrans") # [32, 3, 224, 224]
+        # Calibration Set Loader
+        log("Set Calibration Set.....")
+        # calibration_tensors = calibration_load('/home/sehyunpark/Quant_Preliminary/PSAQ-ViT/CDTrans/calibration_set') # if loading from images
+        calibrate_loader = torch.utils.data.DataLoader(
+            calibration_data.cpu(),
+            batch_size=32,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True)
 
-    log("Generating data.....")
-    log("Using {} as a model...".format(type(model_fq)))
-    calibration_data = generate_data(args, model_fq, name = "CDTrans") # [32, 3, 224, 224]
-
-    # Calibration Set Loader
-    log("Set Calibration Set.....")
-    # calibration_tensors = calibration_load('/home/sehyunpark/Quant_Preliminary/PSAQ-ViT/CDTrans/calibration_set') # if loading from images
-    calibrate_loader = torch.utils.data.DataLoader(
-        calibration_data.cpu(),
-        batch_size=32,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True)
-    
     # Calibration
     model.to(device)
     model.eval()
     if args.quant:
         log('Calibrating......')
+        log(f'Calibration Mode: {args.calibration_mode}')
         model.model_open_calibrate()
         with torch.no_grad():
-            for i, image in enumerate(calibrate_loader):
+            if args.calibration_mode == "PSAQ":
+                for i, image in enumerate(calibrate_loader):
+                    model.model_open_last_calibrate()
+                    image = image.to(device)
+                    _, output, _ = model(None, image, target_branch_only=True)
+            elif args.calibration_mode == "trainset":
+                for i, (image, _, _, _, _) in enumerate(train_loader): # img: [64, 3, 224, 224] -> train loader batch: 32 -> Just use one batch
+                    if i == 0:
+                        model.model_open_last_calibrate()
+                        image = image.to(device)
+                        _, output, _ = model(None, image, target_branch_only=True)
+                        break
+            elif args.calibration_mode == "valset":
+                for i, (image, _, _, _, _, _) in enumerate(val_loader): 
+                # if i == batch_random:
+                    if i == 0:
+                        model.model_open_last_calibrate()
+                        image = image.to(device)
+                        _, output, _ = model(None, image, target_branch_only=True)
+                        break
+            elif args.calibration_mode == "gaussian":
+                calibrate_data = torch.randn((32, 3, 224, 224))
                 model.model_open_last_calibrate()
-                image = image.to(device)
+                image = calibrate_data.to(device)
                 _, output, _ = model(None, image, target_branch_only=True)
         model.model_close_calibrate()
         model.model_quant()
         
     log("Validating.....")
     accuracy = do_inference_uda(cfg, model, val_loader, num_query)
-    print(accuracy)
     log("Classify Domain Adapatation Validation Results - In the source trained model")
-    log("Accuracy: {:.1%}".format(accuracy))
+    log(f'weights: {args.weights}, activation: {args.activation}, attn: {args.attn}')
+    log(f'Calibration Mode: {args.calibration_mode}')
+    log(f'Accuracy: {accuracy}')
+    log("Accuracy (2 d.p): {:.2%}".format(accuracy))
 
