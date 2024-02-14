@@ -1,10 +1,6 @@
-# FQCDTrans
-Architecture of CDTrans with FQ-ViT modules &amp; Apply to PSAQ-ViT
-
-
-
-
 <h1 align="center">FQCDTrans</h1>
+
+Architecture of CDTrans with FQ-ViT modules &amp; Apply to PSAQ-ViT
 
 ## Summary
 
